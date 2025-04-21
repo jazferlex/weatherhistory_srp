@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Real-time Route Data Graph</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+    <style>
+        body {
+            font-family: sans-serif;
+            padding: 20px;
+        }
+
+        canvas {
+            max-width: 100%;
+            height: 500px;
+        }
+
+        #dateSelector {
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h2>Hourly Travel Duration Graph</h2>
+    <select id="dateSelector"></select>
+    <canvas id="routeChart"></canvas>
+
+    <script>
+        const firebaseConfig = {
+            apiKey: "AIzaSyDZcd8lDp_9gHyGPyL3ig3USVRcbXHvAZk",
+            authDomain: "dogwood-actor-450304-k9.firebaseapp.com",
+            projectId: "dogwood-actor-450304-k9",
+            storageBucket: "dogwood-actor-450304-k9.firebasestorage.app",
+            messagingSenderId: "19953101235",
+            appId: "1:19953101235:web:b7bf12acaadf5c833383c6"
+        };
+
+        firebase.initializeApp(firebaseConfig);
+        const db = firebase.firestore();
+
+        const weatherColors = {
+            "Clear": "#FFD700",
+            "Sunny": "#FFCC00",
+            "Partly Cloudy": "#FFE066",
+            "Cloudy": "#B0BEC5",
+            "Patchy light drizzle": "#90CAF9",
+            "Patchy rain nearby": "#64B5F6",
+            "Light rain shower": "#42A5F5"
+        };
+
+        let chart;
+        let weatherDataGlobal = [];
+        const dateSelector = document.getElementById('dateSelector');
+
+        function toPlus8IfNeeded(isoString) {
+            if (typeof isoString !== 'string') {
+                throw new Error("isoString must be a string");
+            }
+            const match = isoString.match(
+                /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d{3,6})?(?:([+-]\d{2}:\d{2})|Z)?$/
+            );
+
+            if (!match) throw new Error("Invalid ISO string");
+
+            const [_, datetime, micro = '', offset = 'Z'] = match;
+
+            if (offset === '+08:00') {
+                return isoString;
+            }
+
+            const utcDate = new Date(isoString);
+            const offsetMs = 8 * 60 * 60 * 1000;
+            const plus8Date = new Date(utcDate.getTime() + offsetMs);
+
+            const pad = (n, z = 2) => ('00' + n).slice(-z);
+
+            const year = plus8Date.getUTCFullYear();
+            const month = pad(plus8Date.getUTCMonth() + 1);
+            const day = pad(plus8Date.getUTCDate());
+            const hour = pad(plus8Date.getUTCHours());
+            const minute = pad(plus8Date.getUTCMinutes());
+            const second = pad(plus8Date.getUTCSeconds());
+
+            const microFormatted = micro.length === 7 ? micro : micro.padEnd(7, '0');
+
+            return `${year}-${month}-${day}T${hour}:${minute}:${second}${microFormatted}+08:00`;
+        }
+
+        async function fetchAllDates() {
+            const snapshot = await db.collection('route_data').get();
+            const dates = new Set();
+
+            snapshot.forEach(doc => {
+                const ts = toPlus8IfNeeded(new Date(doc.data().timestamp).toISOString());
+                dates.add(ts.split("T")[0]);
+            });
+            return Array.from(dates).sort();
+        }
+
+        async function fetchDataForDate(date) {
+            const start = new Date(date + "T00:00:00");
+            const end = new Date(date + "T23:59:59");
+
+            var snapshot = await db.collection('route_data')
+                .orderBy("timestamp")
+                .get();
+
+            const data = snapshot.docs.map(doc => {
+                const d = doc.data();
+                return {
+                    timestamp: new Date(d.timestamp),
+                    forward: d.forward_average_duration_seconds,
+                    reverse: d.reverse_average_duration_seconds,
+                    weather: d.weather_condition
+                };
+            }).filter(d => new Date(d.timestamp) >= start && new Date(d.timestamp) <= end)
+                .map(d => {
+                    // Round the timestamp to the start of the hour (set minutes, seconds, and milliseconds to zero)
+                    const roundedHour = new Date(d.timestamp);
+                    roundedHour.setMinutes(0, 0, 0);
+                    return { ...d, roundedHour };
+                })
+                .reduce((acc, curr) => {
+                    // Only keep the first entry per roundedHour (per hour)
+                    if (!acc.some(item => item.roundedHour.getTime() === curr.roundedHour.getTime())) {
+                        acc.push(curr);
+                    }
+                    return acc;
+                }, []);
+
+            return data;
+        }
+
+        function updateChart(data) {
+            const labels = data.map(d => d.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+            const forwardData = data.map(d => d.forward);
+            const reverseData = data.map(d => d.reverse);
+            const weatherData = data.map(d => d.weather);
+            const weatherBackgroundColors = data.map(d => weatherColors[d.weather] || '#ccc');
+            const weatherStrips = data.map(d => ({ timestamp: d.timestamp, color: weatherColors[d.weather] || '#ccc' }));
+            weatherDataGlobal = data.map(d => d.weather);
+
+            if (chart) {
+                chart.data.labels = labels;
+                chart.data.datasets[0].data = reverseData;
+                chart.data.datasets[1].data = forwardData;
+                chart.data.datasets[0].backgroundColor = weatherBackgroundColors;
+                chart.data.datasets[1].backgroundColor = weatherBackgroundColors;
+                chart.update();
+            } else {
+                const ctx = document.getElementById('routeChart').getContext('2d');
+                chart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels,
+                        datasets: [
+                            {
+                                label: "To North (seconds)",
+                                data: reverseData,
+                                backgroundColor: weatherBackgroundColors,
+                                borderColor: "red",
+                                borderWidth: 2,
+                                pointStyle: 'circle',
+                                pointRadius: 10,
+                            },
+                            {
+                                label: "To South (seconds)",
+                                data: forwardData,
+                                backgroundColor: weatherBackgroundColors,
+                                borderColor: "black",
+                                borderWidth: 2,
+                                pointStyle: 'circle',
+                                pointRadius: 10,
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        plugins: {
+                            tooltip: {
+                                callbacks: {
+                                    afterBody: function (context) {
+                                        const index = context[0].dataIndex;
+                                        const weather = weatherDataGlobal[index];
+                                        return `Weather: ${weather}`;
+                                    }
+
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        async function init() {
+            const allDates = await fetchAllDates();
+            allDates.forEach(date => {
+                const option = document.createElement("option");
+                option.value = date;
+                option.textContent = date;
+                dateSelector.appendChild(option);
+            });
+
+            dateSelector.addEventListener("change", async () => {
+                const selectedDate = dateSelector.value;
+                const data = await fetchDataForDate(selectedDate);
+                updateChart(data);
+            });
+
+            if (allDates.length) {
+                dateSelector.value = allDates[0];
+                const data = await fetchDataForDate(allDates[0]);
+                updateChart(data);
+            }
+        }
+
+        init();
+    </script>
+
+</body>
+
+</html>
